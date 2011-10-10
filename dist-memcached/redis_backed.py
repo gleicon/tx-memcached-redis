@@ -25,78 +25,90 @@ class RedisBackedStorage(object):
 				
 	def doStart(self):
 		self.client = txredisapi.lazyRedisConnectionPool()
-		self.d = {} # temp local dict
 		log.msg('Redis Client initialized ', self.client)
 
 	@defer.inlineCallbacks	
 	def doGet(self, req, data):
 		v = yield self.client.get(req.key)
-		(exp, flags, cas, val) = pickle.loads(v.encode('utf-8'))
-		res = binary.GetResponse(req, flags, cas, data=val)
+		if v is not None:
+			(exp, flags, cas, val) = pickle.loads(v.encode('utf-8'))
+			res = binary.GetResponse(req, flags, cas, data=val)
 		
-		# If the magic 'slow' is requested, slow down.
-		if req.key == 'slow':
-			rv = defer.Deferred()
-			reactor.callLater(5, rv.callback, res)
-			defer.returnValue(rv)
-		else:
-			defer.returnValue(res)
+			# If the magic 'slow' is requested, slow down.
+			if req.key == 'slow':
+				rv = defer.Deferred()
+				reactor.callLater(5, rv.callback, res)
+				defer.returnValue(rv)
+			else:
+				defer.returnValue(res)
 	
-	@defer.inlineCallbacks
 	def doGetQ(self, req, data):
 		try:
-			self.doGet(req, data)
+			o = self.doGet(req, data)
+			return o
 		except binary.MemcachedNotFound:
 			defer.returnValue(binary.EmptyResponse())
 	
-	@defer.inlineCallbacks	
 	def doSet(self, req, data):
 		flags, exp = struct.unpack(constants.SET_PKT_FMT, req.extra)
-		o = yield self.client.set(req.key, pickle.dumps((exp, flags, 0, data)))
-				
-	def doAdd(self, req, data):
-		# work on add + packed data for redis
-		if req.key in self.d:
-			raise binary.MemcachedExists()
-		else:
-			flags, exp = struct.unpack(constants.SET_PKT_FMT, req.extra)
-			self.d[req.key] = (exp, flags, 0, data)
+		o = self.client.set(req.key, pickle.dumps((exp, flags, 0, data)))
 
 	# unsafe (non atomic) operations
-	@defer.inlineCallbacks
+	def doAdd(self, req, data):
+		r = self.client.exists(req.key)
+		def p(v):
+			if v is None:
+				flags, exp = struct.unpack(constants.SET_PKT_FMT, req.extra)
+				o = self.client.set(req.key, pickle.dumps((exp, flags, 0, data)))
+		r.addCallback(p)
+
+	def doReplace(self, req, data):
+		r = self.client.exists(req.key)
+		def p(v):
+			if v is not None:
+				flags, exp = struct.unpack(constants.SET_PKT_FMT, req.extra)
+				o = self.client.set(req.key, pickle.dumps((exp, flags, 0, data)))
+		r.addCallback(p)
+		
+
 	def doIncr(self, req, data):
 		pass
 
-	@defer.inlineCallbacks	
 	def doDecr(self, req, data):
 		pass
 
-	@defer.inlineCallbacks	
 	def doAppend(self, req, newdata):
-		v = yield self.client.get(req.key)
-		(exp, flags, cas, olddata) = pickle.loads(v.encode('utf-8'))
-		n = list(olddata + newdata)
-		n[3] = chr(len(n) + 1)
-		o = yield self.client.set(req.key, pickle.dumps((exp, flags, 0, "".join(n))))
-	
-	@defer.inlineCallbacks
+		r = self.client.get(req.key)
+		def p(v):
+			(exp, flags, cas, olddata) = pickle.loads(v.encode('utf-8'))
+			n = list(olddata + newdata)
+			n[3] = chr(len(n) + 1)
+			o = self.client.set(req.key, pickle.dumps((exp, flags, 0, "".join(n))))
+		r.addCallback(p)
+		
 	def doPrepend(self, req, newdata):
-		v = yield self.client.get(req.key)
-		(exp, flags, cas, olddata) = pickle.loads(v.encode('utf-8'))
-		hdr = list(olddata[:4])
-		body = olddata[4:]
-		c = ord(hdr[3])
-		hdr[3] = chr(c + len(newdata))
-		n = "".join(hdr) + newdata + body
-		o = yield self.client.set(req.key, pickle.dumps((exp, flags, 0, n)))
-
-	@defer.inlineCallbacks	
+		r = self.client.get(req.key)
+		def p(v):
+			(exp, flags, cas, olddata) = pickle.loads(v.encode('utf-8'))
+			hdr = list(olddata[:4])
+			body = olddata[4:]
+			c = ord(hdr[3])
+			hdr[3] = chr(c + len(newdata))
+			n = "".join(hdr) + newdata + body
+			o = self.client.set(req.key, pickle.dumps((exp, flags, 0, n)))
+		r.addCallback(p)
+		
 	def doDelete(self, req, data):
-		o = yield self.client.delete(req.key)
+		r = self.client.exists(req.key)
+		def p(v):
+			if v is None:
+				raise binary.MemcachedNotFound()
+			else:
+				o = self.client.delete(req.key)
+		r.addCallback(p)
 
-	@defer.inlineCallbacks
 	def doFlush(self, req, data):
-		self.d = {}
+		o = self.client.flushdb()
     
 	def doVersion(self, req, data):
 		r = binary.MultiResponse()
@@ -109,6 +121,9 @@ class RedisBackedStorage(object):
 		r.add(binary.Response(req, key='', data=''))
  		return r
 
+	def doNoop(self, req, data):
+		log.msg("noop")
+
 storage = RedisBackedStorage()
 
 def ex(*a):
@@ -116,10 +131,7 @@ def ex(*a):
     raise binary.MemcachedDisconnect()
     # this also works, but apparently confuses people.
     # sys.exit(0)
-
-def doNoop(req, data):
-    return binary.Response(req)
-
+	
 class DistributedBinaryServer(binary.BinaryServerProtocol):
     handlers = {
         constants.CMD_GET: storage.doGet,
@@ -131,11 +143,12 @@ class DistributedBinaryServer(binary.BinaryServerProtocol):
         constants.CMD_DELETE: storage.doDelete,
         constants.CMD_STAT: storage.doStats,
         constants.CMD_FLUSH: storage.doFlush,
-        constants.CMD_NOOP: doNoop,
+        constants.CMD_NOOP: storage.doNoop,
         constants.CMD_QUIT: ex,
         constants.CMD_VERSION: storage.doVersion,
 		constants.CMD_INCR: storage.doIncr,
-		constants.CMD_DECR: storage.doDecr
+		constants.CMD_DECR: storage.doDecr,
+		constants.CMD_REPLACE: storage.doReplace
         }
 
 factory = protocol.Factory()
