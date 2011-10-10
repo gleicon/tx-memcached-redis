@@ -69,9 +69,24 @@ class RedisBackedStorage(object):
 				flags, exp = struct.unpack(constants.SET_PKT_FMT, req.extra)
 				o = self.client.set(req.key, pickle.dumps((exp, flags, 0, data)))
 		r.addCallback(p)
-		
+
+	@defer.inlineCallbacks		
 	def doIncr(self, req, data):
-		pass
+		v = yield self.client.get(req.key)
+		#def p(v):
+		if v is not None:
+			(exp, flags, cas, olddata) = pickle.loads(v.encode('utf-8'))
+			log.msg(olddata)	
+			num = 0
+			try:
+				num = int(olddata)
+				num = num + 1
+			except ValueError:
+				num = 1
+			o = self.client.set(req.key, pickle.dumps((exp, flags, 0, str(num))))
+			res = binary.GetResponse(req, flags, cas, data=str(num))
+			defer.returnValue(res)
+		#r.addCallback(p)
 
 	def doDecr(self, req, data):
 		pass
