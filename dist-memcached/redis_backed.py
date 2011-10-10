@@ -70,7 +70,6 @@ class RedisBackedStorage(object):
 				o = self.client.set(req.key, pickle.dumps((exp, flags, 0, data)))
 		r.addCallback(p)
 		
-
 	def doIncr(self, req, data):
 		pass
 
@@ -82,7 +81,6 @@ class RedisBackedStorage(object):
 		def p(v):
 			(exp, flags, cas, olddata) = pickle.loads(v.encode('utf-8'))
 			n = list(olddata + newdata)
-			n[3] = chr(len(n) + 1)
 			o = self.client.set(req.key, pickle.dumps((exp, flags, 0, "".join(n))))
 		r.addCallback(p)
 		
@@ -90,22 +88,12 @@ class RedisBackedStorage(object):
 		r = self.client.get(req.key)
 		def p(v):
 			(exp, flags, cas, olddata) = pickle.loads(v.encode('utf-8'))
-			hdr = list(olddata[:4])
-			body = olddata[4:]
-			c = ord(hdr[3])
-			hdr[3] = chr(c + len(newdata))
-			n = "".join(hdr) + newdata + body
-			o = self.client.set(req.key, pickle.dumps((exp, flags, 0, n)))
+			n = list(newdata + olddata)
+			o = self.client.set(req.key, pickle.dumps((exp, flags, 0, "".join(n))))
 		r.addCallback(p)
 		
 	def doDelete(self, req, data):
-		r = self.client.exists(req.key)
-		def p(v):
-			if v is None:
-				raise binary.MemcachedNotFound()
-			else:
-				o = self.client.delete(req.key)
-		r.addCallback(p)
+		o = self.client.delete(req.key)
 
 	def doFlush(self, req, data):
 		o = self.client.flushdb()
