@@ -29,20 +29,21 @@ class RedisBackedStorage(object):
 
 	@defer.inlineCallbacks	
 	def doGet(self, req, data):
-		v = yield self.client.get(req.key)
-		if v is not None:
-			(exp, flags, cas, val) = pickle.loads(v.encode('utf-8'))
-			res = binary.GetResponse(req, flags, cas, data=val)
-		
-			# If the magic 'slow' is requested, slow down.
+		log.msg("doGet")
+		v = yield self.client.hgetall(req.key)
+		if len(v) > 1:
+			res = binary.GetResponse(req, v["flags"], v["cas"], data = str(v["data"]))
 			if req.key == 'slow':
 				rv = defer.Deferred()
 				reactor.callLater(5, rv.callback, res)
 				defer.returnValue(rv)
 			else:
 				defer.returnValue(res)
-	
+		else:
+			raise binary.MemcachedNotFound()
+			
 	def doGetQ(self, req, data):
+		log.msg("doGetQ")
 		try:
 			o = self.doGet(req, data)
 			return o
@@ -50,67 +51,100 @@ class RedisBackedStorage(object):
 			defer.returnValue(binary.EmptyResponse())
 	
 	def doSet(self, req, data):
+		log.msg("cas: %s" % req.cas)
 		flags, exp = struct.unpack(constants.SET_PKT_FMT, req.extra)
-		o = self.client.set(req.key, pickle.dumps((exp, flags, 0, data)))
+		o = self.client.hmset(req.key, {"exp": exp, "flags": flags, "cas": 0, "data": data})
 
 	# unsafe (non atomic) operations
+	
 	def doAdd(self, req, data):
+		log.msg("add")
 		r = self.client.exists(req.key)
+		res = None
 		def p(v):
-			if v is None:
+			if v is 0:
 				flags, exp = struct.unpack(constants.SET_PKT_FMT, req.extra)
-				o = self.client.set(req.key, pickle.dumps((exp, flags, 0, data)))
+				o = self.client.hmset(req.key, {"exp": exp, "flags": flags, "cas": 0, "data": data})
+				res = binary.Response(req, cas=req.cas)
+				log.msg("add: %s" % data)
+			else:
+				raise binary.MemcachedExists()
 		r.addCallback(p)
-
+		return res
+		
 	def doReplace(self, req, data):
+		log.msg("replace")
 		r = self.client.exists(req.key)
+		res = None
 		def p(v):
-			if v is not None:
+			if v > 0:
 				flags, exp = struct.unpack(constants.SET_PKT_FMT, req.extra)
-				o = self.client.set(req.key, pickle.dumps((exp, flags, 0, data)))
+				o = self.client.hmset(req.key, {"exp": exp, "flags": flags, "cas": 0, "data": data})
+				res = binary.Response(req, cas=req.cas)
+			else:
+				raise binary.MemcachedNotFound()
 		r.addCallback(p)
+		return res
 
 	@defer.inlineCallbacks		
 	def doIncr(self, req, data):
-		v = yield self.client.get(req.key)
-		#def p(v):
-		if v is not None:
-			(exp, flags, cas, olddata) = pickle.loads(v.encode('utf-8'))
-			log.msg(olddata)	
-			num = 0
-			try:
-				num = int(olddata)
-				num = num + 1
-			except ValueError:
-				num = 1
-			o = self.client.set(req.key, pickle.dumps((exp, flags, 0, str(num))))
-			res = binary.GetResponse(req, flags, cas, data=str(num))
+		log.msg("incr")
+		log.msg("i cas: %s" % req.cas)
+		r = yield self.client.exists(req.key)
+		if r:
+			v = yield self.client.hgetall(req.key)
+			log.msg("incr v -> %s" % v)
+			o = self.client.hincr(req.key, "data")
+			res = binary.Response(req, cas=v["cas"], data=str(v["data"] + 1))
 			defer.returnValue(res)
-		#r.addCallback(p)
+		else:			
+			raise binary.MemcachedNotFound()
 
+	@defer.inlineCallbacks		
 	def doDecr(self, req, data):
-		pass
+		log.msg("decr")
+		v = yield self.client.exists(req.key)	
+		if v:
+			v = yield self.client.hgetall(req.key)
+			log.msg("old val: %s" % v["data"])
+			o = self.client.hdecr(req.key, "data")
+			res = binary.Response(req, cas=v["cas"], data=str(v["data"] - 1))
+			defer.returnValue(res)
+		else:
+			raise binary.MemcachedNotFound()
 
 	def doAppend(self, req, newdata):
-		r = self.client.get(req.key)
+		log.msg("append")
+		r = self.client.hgetall(req.key)		
 		def p(v):
-			(exp, flags, cas, olddata) = pickle.loads(v.encode('utf-8'))
-			n = list(olddata + newdata)
-			o = self.client.set(req.key, pickle.dumps((exp, flags, 0, "".join(n))))
+			if len(v) > 1:
+				n = list(v["data"] + newdata)
+				o = self.client.hset(req.key, "data", "".join(n))
+				res = binary.Response(req, cas=v["cas"], data="".join(n))
+				return res
+			else:
+				raise binary.MemcachedNotFound()
 		r.addCallback(p)
 		
 	def doPrepend(self, req, newdata):
-		r = self.client.get(req.key)
+		log.msg("prepend")		
+		r = self.client.hgetall(req.key)		
 		def p(v):
-			(exp, flags, cas, olddata) = pickle.loads(v.encode('utf-8'))
-			n = list(newdata + olddata)
-			o = self.client.set(req.key, pickle.dumps((exp, flags, 0, "".join(n))))
+			if len(v) > 1:
+				n = list(newdata + v["data"])
+				o = self.client.hset(req.key, "data", "".join(n))
+				res = binary.Response(req, cas=v["cas"], data="".join(n))
+				return res
+			else:
+				raise binary.MemcachedNotFound()
 		r.addCallback(p)
-		
+				
 	def doDelete(self, req, data):
+		log.msg("delete")
 		o = self.client.delete(req.key)
 
 	def doFlush(self, req, data):
+		log.msg("flush")
 		o = self.client.flushdb()
     
 	def doVersion(self, req, data):
@@ -132,8 +166,6 @@ storage = RedisBackedStorage()
 def ex(*a):
     print "Shutting down a client."
     raise binary.MemcachedDisconnect()
-    # this also works, but apparently confuses people.
-    # sys.exit(0)
 	
 class DistributedBinaryServer(binary.BinaryServerProtocol):
     handlers = {
