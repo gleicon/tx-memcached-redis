@@ -156,6 +156,8 @@ class BinaryServerProtocol(stateful.StatefulProtocol):
         return self.getInitialState()
 
     def _respond(self, res):
+        log.msg("_responde %s" % repr(res))
+        log.msg("_responde %s" % res.toSequence())
         self.transport.writeSequence(res.toSequence())
 
     def unknownCommand(self, request, data):
